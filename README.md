@@ -30,7 +30,7 @@ bao_emu test                    build everything and check it all
 
 On Linux, macOS or WSL use `./bao_emu.sh`. If the SDK is somewhere else, set `DABAO_SDK` to its folder or pass `--sdk PATH` first. Anything after the program name goes to baoemu (or the viewer), so `--ms`, `--button PB3=0`, `--sd card.img` and the rest all work. Without `--ms` the program runs in real time and what you type goes to UART2, like a board on a serial terminal.
 
-You need what `bao_flash` needs: the xPack `riscv-none-elf-gcc` 15.2.0-1 toolchain, Python 3 and `pip install pure25519`. `pip install pyfatfs` lets the SD card examples make their own card image. The viewer needs tkinter, which ships with Python on Windows (`sudo apt install python3-tk` on Ubuntu).
+You need what `bao_flash` needs which is xPack `riscv-none-elf-gcc` 15.2.0-1 toolchain, Python 3 and `pip install pure25519`. `pip install pyfatfs` lets the SD card examples make their own card image. 
 
 ## Building
 
