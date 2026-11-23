@@ -2,7 +2,7 @@
 
 A Baochip-1x emulator by Armstrong Subero, RV Embedded.
 
-baoemu runs Dabao SDK programs (ELF, UF2 or raw BIN) on a model of the Baochip-1x. The VexRiscv CPU with its MMU and pipeline timing, the memory map, the UDMA peripherals, timers and interrupt arrays, GPIO, the SCE with the PKE and big number ALU, PWM, the PL230 MDMA, the mailbox, the four BIO cores, the USB device controller. Also some common parts that sit on the Dabao's buses. 
+baoemu runs Dabao SDK programs (ELF, UF2 or raw BIN) on a model of the Baochip-1x. Also some common parts that sit on the Dabao's buses. 
 
 It is plain C99 with no global state and no dependencies, and builds as a command line tool and as a shared library driven from Python through ctypes.
 
