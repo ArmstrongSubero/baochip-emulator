@@ -150,8 +150,16 @@ static void uart_start_tx(bao_t *b, int i)
     for (k = 0; k < n; k++)
         if (b->uart_cb)
             b->uart_cb(b->uart_user, i, buf[k]);
-    u->tx_busy = 1;
-    u->tx_done_at = b->cycles + (n ? n : 1) * uart_byte_cycles(b, u);
+    /* the event comes when the last byte reaches the shifter; STATUS stays
+     * busy for that byte (measured on the Dabao) */
+    {
+        uint64_t byte = uart_byte_cycles(b, u);
+        uint64_t base = u->tx_shift_until > b->cycles ? u->tx_shift_until : b->cycles;
+        uint64_t count = n ? n : 1;
+        u->tx_busy = 1;
+        u->tx_done_at = base + (count - 1) * byte + 1;
+        u->tx_shift_until = base + count * byte;
+    }
     u->tx_pending_len = (int)n;
     bao_kick(b);
 }
@@ -570,7 +578,7 @@ int udma_read(bao_t *b, uint32_t a, uint32_t *v)
         if (off < 0x10) return ch_reg_read(&u->rx, off, v) ? 0 : udma_none(b, a, v);
         if (off < 0x20) return ch_reg_read(&u->tx, off - 0x10, v) ? 0 : udma_none(b, a, v);
         switch (off) {
-        case 0x20: *v = (u->tx_busy ? 1u : 0); return 0;
+        case 0x20: *v = (u->tx_busy || b->cycles < u->tx_shift_until) ? 1u : 0; return 0;
         case 0x24: *v = u->setup & UART_SETUP_MASK; return 0;
         case 0x28: *v = u->error & 3; u->error = 0; b->side++; return 0;
         case 0x2C: *v = u->irq_en & 3; return 0;
@@ -727,6 +735,7 @@ uint64_t udma_next_event(bao_t *b)
     for (i = 0; i < 4; i++) {
         uart_t *u = &b->uart[i];
         if (u->tx_busy && u->tx_done_at < n) n = u->tx_done_at;
+        if (u->tx_shift_until > b->cycles && u->tx_shift_until < n) n = u->tx_shift_until;
         if (u->host_count > 0 && uart_rx_ready(u)) {
             uint64_t t = u->rx_next_at > b->cycles ? u->rx_next_at : b->cycles + 1;
             if (t < n) n = t;

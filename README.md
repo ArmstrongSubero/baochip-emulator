@@ -2,9 +2,7 @@
 
 A Baochip-1x emulator by Armstrong Subero, RV Embedded.
 
-baoemu runs Dabao SDK programs (ELF, UF2 or raw BIN) on a model of the Baochip-1x. Also some common parts that sit on the Dabao's buses. 
-
-It is plain C99 with no global state and no dependencies, and builds as a command line tool and as a shared library driven from Python through ctypes.
+baoemu runs Dabao SDK programs (ELF, UF2 or raw BIN) on a model of the Baochip-1x: the VexRiscv CPU with its MMU and pipeline timing, the memory map, the UDMA peripherals, timers and interrupt arrays, GPIO, the SCE with the PKE and big number ALU, PWM, the PL230 MDMA, the mailbox, the four BIO cores, the USB device controller, and common parts that sit on the Dabao's buses. It is plain C99 with no global state and no dependencies, and builds as a command line tool and as a shared library driven from Python through ctypes.
 
 Register behaviour comes from the Baochip-1x RTL ([baochip/baochip-1x](https://github.com/baochip/baochip-1x)), the register map in xous-core (`utralib/bao1x/*.svd`) and the Dabao SDK drivers. No code was copied from those repositories.
 
@@ -30,7 +28,7 @@ bao_emu test                    build everything and check it all
 
 On Linux, macOS or WSL use `./bao_emu.sh`. If the SDK is somewhere else, set `DABAO_SDK` to its folder or pass `--sdk PATH` first. Anything after the program name goes to baoemu (or the viewer), so `--ms`, `--button PB3=0`, `--sd card.img` and the rest all work. Without `--ms` the program runs in real time and what you type goes to UART2, like a board on a serial terminal.
 
-You need what `bao_flash` needs which is xPack `riscv-none-elf-gcc` 15.2.0-1 toolchain, Python 3 and `pip install pure25519`. `pip install pyfatfs` lets the SD card examples make their own card image. 
+You need what `bao_flash` needs: the xPack `riscv-none-elf-gcc` 15.2.0-1 toolchain, Python 3 and `pip install pure25519`. `pip install pyfatfs` lets the SD card examples make their own card image. The viewer needs tkinter, which ships with Python on Windows (`sudo apt install python3-tk` on Ubuntu).
 
 ## Building
 
@@ -64,15 +62,9 @@ baoemu --ms 1500 --attach st7796:2:0:dc=PC10,cs=PC6 --attach ft6336:0:0x38 \
 
 UART2 (PB14) goes to stdout. Warnings, traces and the stop line go to stderr with the emulated time. Run `baoemu` with no arguments for the full option list. The exit code is 1 when the run stopped on the guard or an exception.
 
-
-
 A PC is attached to the USB port unless `--no-usb` is given. It enumerates the device, opens the CDC serial port if there is one and finds a mass storage disk. USB serial output is printed as `[USB]` lines, and `--usb-console` makes it the console.
 
-
-
 `--attach KIND:BUS:SELECT:OPTIONS` puts a built in part on a bus. `cs=` selects it with a GPIO instead of the SPIM chip select, `dc=` names a display's data/command pin and `int=` a touch interrupt pin.
-
-
 
 ## Python
 
@@ -104,8 +96,6 @@ print(chip.usb_serial())
 
 Parts that are not built in can be written in Python with `on_spi(xfer, cs)`, `on_i2c(fn)` and `on_gpio(fn)`. `pwm(slice, channel)` returns frequency and duty, and `peek32(addr)` reads a peripheral register as the CPU would.
 
-
-
 ## Viewer
 
 ```
@@ -114,52 +104,42 @@ python python/bao_view.py ../dabao-sdk-main/build/rv1_game.elf --dc PC10 --cs PC
 
 A tkinter window that acts like an RV1 on your desk: the panel, the UART2 console with a box to type into, and a status line with emulated time. It runs at real time. Left mouse is the first finger and right mouse holds a second. `--key z=PB3` wires a key to an input pin. `bao_emu view lcd` does the build and the pins for you.
 
-
-
 ## What is modelled
 
-| Block       | Coverage                                                                                                                                                                                    |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| CPU         | RV32IMAC, Zicsr, M, S and U privilege, delegation, the AesZknPlugin scalar AES instructions, custom cache flush `0x500F`                                                                    |
-| CPU timing  | VexRiscv pipeline as GenCramSoC.scala builds it: result latency, static branch prediction, redirects, CSR drain, divider, uncached loads, cache flushes, traps. The table is in `src/cpu.c` |
-| MMU         | Sv32 with 8 line TLBs per port, superpages, SUM, MXR, MPRV, sfence.vma                                                                                                                      |
-| Memory      | RRAM 4 MB, SRAM 2 MB (filled with 0xCD so a missing .bss clear shows), IFRAM 256 KB                                                                                                         |
-| RRAM writes | RRC staging and page commits, image kept in a file with `--rram`                                                                                                                            |
-| Guard       | stores into boot0 and boot1, RRC accesses other than RRC_CR, the security region and unreviewed boot chain registers stop the run                                                           |
-| CGU         | sysctrl registers at RTL widths and reset values, software reset through RCURST0 and RCURST1                                                                                                |
-| Interrupts  | all 20 IRQ arrays, MIM, MIP, SIM and SIP, TickTimer and Timer0 lines                                                                                                                        |
-| Timers      | TickTimer, Timer0, D11CTIME, WDT, RTC, both ATimer instances, power down and wake                                                                                                           |
-| GPIO        | IOX alternate functions, pull ups, eight interrupt channels, BIO handover, PWM on AF3                                                                                                       |
-| PWM         | four slices of the PULP apb_adv_timer with all channel modes and CH_EN gating                                                                                                               |
-| UDMA        | UART, SPI master, I2C and ADC with clock gating, channel readback and bus timing                                                                                                            |
-| SCE         | SHA-256, SHA-512 and HMAC on the hash engine, AES 128/192/256 in ECB, CBC, CTR, OFB and CFB, TRNG, PKE, big number ALU, SDMA internal channel, RAM clear, register blocks at RTL widths     |
-| BIO         | four PicoRV32 cores stepped per aclk, x16 to x31 extensions, FIFOs, quantum dividers, snap, masked GPIO, events, pioirq lines, DMA through the filter windows                               |
-| MDMA        | PL230 with eight channels, every cycle type, and the request block                                                                                                                          |
-| Mailbox     | MAILBOX, MBOX_APB and MB_CLIENT with loopback, FIFOs, errors and abort                                                                                                                      |
-| USB         | Corigine controller modelled from its register header and the TinyUSB driver, with a host that does CDC and mass storage                                                                    |
-| Parts       | SPI loopback, W25Q128 flash, SD card (SPI mode, SDHC), MPU6050, ST7796S 320x480 panel, FT6336U touch                                                                                        |
+| Block | Coverage |
+|---|---|
+| CPU | RV32IMAC, Zicsr, M, S and U privilege, delegation, the AesZknPlugin scalar AES instructions, custom cache flush `0x500F` |
+| CPU timing | VexRiscv pipeline as GenCramSoC.scala builds it: result latency, static branch prediction, redirects, CSR drain, divider, uncached loads, cache flushes, traps. The table is in `src/cpu.c` |
+| MMU | Sv32 with 8 line TLBs per port, superpages, SUM, MXR, MPRV, sfence.vma |
+| Memory | RRAM 4 MB, SRAM 2 MB (filled with 0xCD so a missing .bss clear shows), IFRAM 256 KB |
+| RRAM writes | RRC staging and page commits, image kept in a file with `--rram` |
+| Guard | stores into boot0 and boot1, RRC accesses other than RRC_CR, the security region and unreviewed boot chain registers stop the run |
+| CGU | sysctrl registers at RTL widths and reset values, software reset through RCURST0 and RCURST1 |
+| Interrupts | all 20 IRQ arrays, MIM, MIP, SIM and SIP, TickTimer and Timer0 lines |
+| Timers | TickTimer, Timer0, D11CTIME, WDT, RTC, both ATimer instances, power down and wake |
+| GPIO | IOX alternate functions, pull ups, eight interrupt channels, BIO handover, PWM on AF3 |
+| PWM | four slices of the PULP apb_adv_timer with all channel modes and CH_EN gating |
+| UDMA | UART, SPI master, I2C and ADC with clock gating, channel readback and bus timing |
+| SCE | SHA-256, SHA-512 and HMAC on the hash engine, AES 128/192/256 in ECB, CBC, CTR, OFB and CFB, TRNG, PKE, big number ALU, SDMA internal channel, RAM clear, register blocks at RTL widths |
+| BIO | four PicoRV32 cores stepped per aclk, x16 to x31 extensions, FIFOs, quantum dividers, snap, masked GPIO, events, pioirq lines, DMA through the filter windows |
+| MDMA | PL230 with eight channels, every cycle type, and the request block |
+| Mailbox | MAILBOX, MBOX_APB and MB_CLIENT with loopback, FIFOs, errors and abort |
+| USB | Corigine controller modelled from its register header and the TinyUSB driver, with a host that does CDC and mass storage |
+| Parts | SPI loopback, W25Q128 flash, SD card (SPI mode, SDHC), MPU6050, ST7796S 320x480 panel, FT6336U touch |
 
-Not modelled (mainly becaue this was meant for Dabao board emulation): SDIO, I2S, the camera, QFC and XIP, the DUART, PMP (the core has none), speculative TLB fills, the CGU frequency sensors, and RIPEMD, BLAKE and SHA3 on the hash engine. 
-
-The PKE, ALU, hash engine and MDMA finish in no time, and both CPU caches always hit. Registers that are not modelled act as storage and are reported once in the log.
-
-
+Not modelled: SDIO, I2S, the camera, QFC and XIP, the DUART, PMP (the core has none), speculative TLB fills, a reprogrammed PLL changing the CPU speed (the frequency sensors follow the clock registers, but timing stays at 350 MHz), and RIPEMD, BLAKE and SHA3 on the hash engine. The PKE, ALU, hash engine and MDMA finish in no time, and both CPU caches always hit. Registers that are not modelled act as storage and are reported once in the log.
 
 ## Timing
 
 Time is counted in CPU cycles at ACLK (350 MHz), so a run is deterministic and independent of host speed. The BIO runs at FCLK, which follows the divider `bio_init` writes. Idle loops are fast forwarded to the next timer tick or peripheral event; `--no-fast-forward` turns this off and `tests/ff_compare.py` checks both give the same output and final cycle count.
 
-
-
 ## Tests
 
 `bao_emu test` builds every SDK example and every program in `tests/programs`, then runs `tests/run_examples.py` on them. 80 are checked against lines of their expected output; the rest, mostly book chapter examples, must run without tripping the guard or an exception. SDK examples whose names start with `zz_` are board only and are skipped.
 
-
-
 `tests/programs` holds baoemu's own test programs: register readback, CPU timing, scalar AES, the MMU, the mailbox, MDMA, BIO, the crypto vectors and the panel. `bao_emu` copies one into the SDK's `examples` for the length of its build and removes it again, so the SDK is left as it was. `tests/ff_compare.py` checks every program gives the same output with fast forward on and off, `tests/sign_ref.py` checks the ECDSA and Ed25519 vectors on the host, and `tests/bioasm.py` assembles BIO programs into C arrays.
 
-
+`tests/fuzz_mmio.c` throws random register accesses, instruction words and host events at the emulator, alone or between the instructions of a loaded program. Build it with the address and undefined behaviour sanitizers; the command is at the top of the file.
 
 ## Files
 
@@ -182,7 +162,7 @@ src/main.c          command line tool
 bao_emu.py          build and run a program (bao_emu.sh, bao_emu.bat)
 python/baoemu.py    ctypes bindings
 python/bao_view.py  viewer window
-tests/              runner, fast forward check, references
+tests/              runner, fast forward check, fuzzer, references
 tests/programs/     baoemu's test programs
 ```
 

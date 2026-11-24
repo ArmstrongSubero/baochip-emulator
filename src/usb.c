@@ -78,10 +78,12 @@ enum { C_IDLE, C_DATA_IN, C_DATA_OUT, C_STATUS, C_DONE };
 enum {
     H_OFF, H_ATTACH, H_RESET, H_DEV64, H_ADDR, H_DEV18, H_CFG9, H_CFG, H_STR0,
     H_STRP, H_QUAL, H_SETCFG, H_LINE0, H_CODING, H_LINE1, H_LUN, H_INQUIRY,
-    H_UNIT, H_CAPACITY, H_READY, H_FAILED
+    H_FORMATS, H_UNIT, H_CAPACITY, H_MODE, H_READY, H_FAILED
 };
 
 enum { M_IDLE, M_CBW, M_DATA_IN, M_DATA_OUT, M_CSW, M_DONE, M_FIN };
+
+#define STALL_TRIES      4
 
 #define DISK_MAX        65536u
 
@@ -90,6 +92,7 @@ typedef struct {
     int      dcs;
     int      mps;
     int      halted;
+    int      stopped;    /* set by SET_HALT, cleared only by SET_TR_DQ_PTR or a new CONFIG_EP */
 } ring_t;
 
 typedef struct {
@@ -127,7 +130,7 @@ typedef struct {
     int      open;
 
     int      msc_itf, msc_in, msc_out;
-    int      m_state, m_in, m_cblen, m_failed, m_sense, m_tries;
+    int      m_state, m_in, m_cblen, m_failed, m_sense, m_tries, m_stalls, m_clear;
     uint8_t  m_cb[16];
     uint8_t  m_buf[DISK_MAX];
     uint32_t m_len, m_got, m_tag;
@@ -393,6 +396,8 @@ static void msc_start(bao_t *b, usb_t *u, const uint8_t *cb, int cblen, int in, 
     u->m_in = in;
     u->m_len = len > DISK_MAX ? DISK_MAX : len;
     u->m_got = 0;
+    u->m_stalls = 0;
+    u->m_clear = 0;
     u->m_tag++;
     u->m_state = M_CBW;
     u->m_deadline = b->cycles + 2000ull * MS;
@@ -468,7 +473,21 @@ static void msc_poll(bao_t *b, usb_t *u)
 {
     static const uint8_t sense[6] = { 0x03, 0, 0, 0, 18, 0 };
     if (u->m_state >= M_CBW && u->m_state <= M_CSW) {
-        if ((u->msc_in >= 0 && u->ep[u->msc_in].halted) || (u->msc_out >= 0 && u->ep[u->msc_out].halted)) {
+        int in_halt = u->msc_in >= 0 && u->ep[u->msc_in].halted;
+        int out_halt = u->msc_out >= 0 && u->ep[u->msc_out].halted;
+        if (u->m_clear || (in_halt && !out_halt && u->m_stalls < STALL_TRIES)) {
+            /* A stalled Bulk-In pipe: clear the halt as a PC does, then read the status */
+            if (!u->m_clear) {
+                u->m_clear = 1;
+                u->m_stalls++;
+            }
+            if (req(b, u, 0x02, 1, 0, (uint16_t)(0x80 | (u->msc_in / 2)), 0, NULL)) {
+                u->m_clear = 0;
+                if (u->m_state != M_CSW)
+                    u->m_state = M_CSW;
+            }
+            wake(b, u, MICROFRAME);
+        } else if (in_halt || out_halt) {
             bao_logf(b, BAO_LOG_WARN, "USB disk endpoint stalled, which this host does not recover from");
             u->m_failed = 1;
             u->m_state = M_FIN;
@@ -527,8 +546,7 @@ static void ep_service(bao_t *b, usb_t *u)
         return;
     for (pei = 2; pei < PEI_COUNT; pei++) {
         ring_t *r = &u->ep[pei];
-        u->eprunning &= ~(1u << pei);
-        if (!(u->epenable & (1u << pei)) || r->halted)
+        if (!(u->epenable & (1u << pei)) || r->halted || r->stopped)
             continue;
         while (ring_peek(b, r, &t)) {
             uint32_t at = r->deq;
@@ -543,10 +561,8 @@ static void ep_service(bao_t *b, usb_t *u)
                 ev_transfer(b, u, pei, at, 0, CC_SUCCESS);
             } else {
                 uint32_t n = host_tx(u, pei, buf, len);
-                if (!n) {
-                    u->eprunning |= 1u << pei;
+                if (!n)
                     break;
-                }
                 dma_wr(b, t.dw[0], buf, n);
                 r->deq += 16;
                 ev_transfer(b, u, pei, at, len - n, n < len ? CC_SHORT : CC_SUCCESS);
@@ -601,6 +617,9 @@ static int host_step(bao_t *b, usb_t *u)
     static const uint8_t inquiry[6] = { 0x12, 0, 0, 0, 36, 0 };
     static const uint8_t unit[6] = { 0x00, 0, 0, 0, 0, 0 };
     static const uint8_t capacity[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    /* Windows asks for more than these return, which makes a device stall Bulk-In */
+    static const uint8_t formats[10] = { 0x23, 0, 0, 0, 0, 0, 0, 0, 252, 0 };
+    static const uint8_t mode[6] = { 0x1A, 0, 0x3F, 0, 192, 0 };
     int disk = 0;
     switch (u->hs) {
     case H_ATTACH:
@@ -692,6 +711,10 @@ static int host_step(bao_t *b, usb_t *u)
         if (!scsi(b, u, inquiry, 6, 1, 36)) return 0;
         if (u->m_failed) { bao_logf(b, BAO_LOG_WARN, "USB disk did not answer INQUIRY"); u->hs = H_READY; break; }
         u->m_tries = 0;
+        u->hs = H_FORMATS;
+        break;
+    case H_FORMATS:
+        if (!scsi(b, u, formats, 10, 1, 252)) return 0;
         u->hs = H_UNIT;
         break;
     case H_UNIT:
@@ -715,6 +738,10 @@ static int host_step(bao_t *b, usb_t *u)
         } else {
             bao_logf(b, BAO_LOG_WARN, "USB disk did not give its capacity");
         }
+        u->hs = H_MODE;
+        break;
+    case H_MODE:
+        if (!scsi(b, u, mode, 6, 1, 192)) return 0;
         u->hs = H_READY;
         break;
     default:
@@ -783,23 +810,52 @@ static void command(bao_t *b, usb_t *u, uint32_t v)
             u->ep[pei].dcs = (int)(cx[2] & 1u);
             u->ep[pei].mps = (int)(cx[1] >> 16);
             u->ep[pei].halted = 0;
+            u->ep[pei].stopped = 0;
             u->epenable |= 1u << pei;
         }
         break;
     case 5:    /* SET_HALT */
-        for (pei = 0; pei < PEI_COUNT; pei++)
-            if (p0 & (1u << pei))
-                u->ep[pei].halted = 1;
+        /* halted endpoint leaves EPRUNNING, context gets the dequeue position */
+        for (pei = 0; pei < PEI_COUNT; pei++) {
+            if (!(p0 & (1u << pei)))
+                continue;
+            u->ep[pei].halted = 1;
+            if (pei >= 2) {
+                uint32_t dq = u->ep[pei].deq | (uint32_t)u->ep[pei].dcs;
+                u->ep[pei].stopped = 1;
+                u->eprunning &= ~(1u << pei);
+                dma_wr(b, u->regs[R_DCBAPLO / 4] + (uint32_t)(pei - 2) * 16 + 8, &dq, 4);
+            }
+        }
         if ((p0 & 3u) && u->phase != C_IDLE && u->phase != C_DONE) {
             u->stalled = 1;
             u->phase = C_DONE;
         }
         break;
     case 6:    /* CLEAR_HALT */
-    case 7:    /* RESET_EP */
+        /* does not restart the endpoint, SET_TR_DQ_PTR does */
         for (pei = 0; pei < PEI_COUNT; pei++)
             if (p0 & (1u << pei))
                 u->ep[pei].halted = 0;
+        break;
+    case 7:    /* RESET_EP */
+        for (pei = 0; pei < PEI_COUNT; pei++)
+            if (p0 & (1u << pei))
+                u->ep[pei].halted = u->ep[pei].stopped = 0;
+        break;
+    case 9:    /* SET_TR_DQ_PTR */
+        for (pei = 2; pei < PEI_COUNT; pei++) {
+            uint32_t cx[4];
+            if (!(p0 & (1u << pei)) || !(u->epenable & (1u << pei)))
+                continue;
+            if (dma_rd(b, u->regs[R_DCBAPLO / 4] + (uint32_t)(pei - 2) * 16, cx, 16))
+                continue;
+            u->ep[pei].deq = cx[2] & ~0xFu;
+            u->ep[pei].dcs = (int)(cx[2] & 1u);
+            u->ep[pei].stopped = 0;
+            u->eprunning |= 1u << pei;
+        }
+        wake(b, u, MICROFRAME);
         break;
     case 8:    /* STOP_EP */
         u->eprunning &= ~p0;
@@ -900,7 +956,7 @@ int usb_write(bao_t *b, uint32_t addr, uint32_t v)
             u->cmdctrl = v;
         break;
     case R_DOORBELL:
-        if ((v & 0x1Fu) >= 2 && (v & 0x1Fu) < PEI_COUNT)
+        if ((v & 0x1Fu) >= 2 && (v & 0x1Fu) < PEI_COUNT && !u->ep[v & 0x1Fu].stopped)
             u->eprunning |= 1u << (v & 0x1Fu);
         wake(b, u, MICROFRAME);
         break;

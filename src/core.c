@@ -68,6 +68,15 @@ bao_t *bao_new(void)
         return NULL;
     }
     memset(b->rram, 0xFF, RRAM_SIZE);
+    /* SERIAL_NUMBER and UUID at 0x603E0000: placeholder bytes, not a real layout */
+    {
+        static const uint8_t serial[8] = { 'B', 'A', 'O', 'E', 'M', 'U', 0x00, 0x01 };
+        static const uint8_t uuid[16] = { 0x62, 0x61, 0x6F, 0x65, 0x6D, 0x75, 0x40, 0x00,
+                                          0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        memset(b->rram + 0x3E0000, 0x00, 64);
+        memcpy(b->rram + 0x3E0000, serial, sizeof(serial));
+        memcpy(b->rram + 0x3E0020, uuid, sizeof(uuid));
+    }
     map_region(b, RRAM_BASE, RRAM_SIZE, b->rram, 0);
     map_region(b, SRAM_BASE, SRAM_SIZE, b->sram, 1);
     map_region(b, IFRAM_BASE, IFRAM_SIZE, b->ifram, 1);
@@ -114,6 +123,7 @@ void bao_reset(bao_t *b)
     /* power on and the RESET pin reset the always on domain */
     b->rtc_lr = b->rtc_cr = b->rtc_frozen = b->rtc_fd = 0;
     b->rtc_mr = b->rtc_imsc = b->rtc_ris = b->rtc_seen = 0;
+    b->rtc_cnt0 = b->rtc_lvl0 = b->rtc_pend = 0;
     b->at_cfg[2] = b->at_cfg[3] = b->at_cmp[2] = b->at_cmp[3] = 0;
     b->at_base_val[2] = b->at_base_val[3] = 0;
     b->at_base[2] = b->at_base[3] = 0;
@@ -399,7 +409,7 @@ void bao_stop(bao_t *b) { bao_halt(b, BAO_STOP_USER, "stopped by host"); }
 int bao_stop_reason(bao_t *b) { return b->stop; }
 const char *bao_stop_message(bao_t *b) { return b->stop_msg; }
 uint64_t bao_cycles(bao_t *b) { return b->cycles; }
-uint64_t bao_millis(bao_t *b) { return b->tt_base_ms + (b->cycles - b->tt_base_cycle) / b->tt_cpt; }
+uint64_t bao_millis(bao_t *b) { tt_sync(b); return b->tt_base_ms + (b->cycles - b->tt_base_cycle) / b->tt_cpt; }
 uint32_t bao_get_pc(bao_t *b) { return b->pc; }
 void bao_set_pc(bao_t *b, uint32_t pc) { b->pc = pc; }
 uint32_t bao_get_reg(bao_t *b, int r) { return (r > 0 && r < 32) ? b->x[r] : 0; }

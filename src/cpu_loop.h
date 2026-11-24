@@ -52,7 +52,9 @@ static int LOOP_NAME(bao_t *b)
         case 0x6F: {
             int32_t imm = sext((((ins >> 31) & 1) << 20) | (((ins >> 21) & 0x3FF) << 1) |
                                (((ins >> 20) & 1) << 11) | (((ins >> 12) & 0xFF) << 12), 21);
-            if (imm == 0 && RD(ins) == 0) {
+            /* a jump to itself ends the run unless a machine interrupt can be taken */
+            if (imm == 0 && RD(ins) == 0 &&
+                !(b->priv == PRIV_M && (b->mstatus & MSTATUS_MIE) && (b->mie & MIP_MEIP) && b->mim)) {
                 bao_halt(b, BAO_STOP_HALT, "self loop at %s", bao_where(b, pc));
                 goto next;
             }

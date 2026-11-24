@@ -133,24 +133,42 @@ static void irq_relevel(bao_t *b, int a)
         }
 }
 
+/* TickTimer prescaler (bao_core.py 1793 to 1851): a tick is CLOCKS_PER_TICK
+ * plus one cycles, and a new value takes over at the next tick or a reset */
+void tt_sync(bao_t *b)
+{
+    if (b->tt_next && b->cycles >= b->tt_switch) {
+        b->tt_base_ms += (b->tt_switch - b->tt_base_cycle) / b->tt_cpt;
+        b->tt_base_cycle = b->tt_switch;
+        b->tt_cpt = b->tt_next;
+        b->tt_next = 0;
+    }
+}
+
 static uint64_t tt_ms(bao_t *b)
 {
+    tt_sync(b);
     return b->tt_base_ms + (b->cycles - b->tt_base_cycle) / b->tt_cpt;
 }
 
-static void tt_rebase(bao_t *b)
+/* msleep alarm is a level while target <= time (bao_core.py), EV_PENDING
+ * does not clear it */
+static int tt_alarm_level(bao_t *b)
 {
-    b->tt_base_ms = tt_ms(b);
-    b->tt_base_cycle = b->cycles;
+    return tt_ms(b) >= b->tt_target;
 }
 
 static uint64_t tt_alarm_cycle(bao_t *b)
 {
-    uint64_t now = tt_ms(b);
-    if (b->tt_target == NEVER)
+    if (tt_alarm_level(b))
         return NEVER;
-    if (b->tt_target <= now)
-        return b->cycles;
+    if (b->tt_next) {
+        /* ticks up to the change run at the old rate, the rest at the new */
+        uint64_t at = b->tt_base_ms + (b->tt_switch - b->tt_base_cycle) / b->tt_cpt;
+        if (b->tt_target <= at)
+            return b->tt_base_cycle + (b->tt_target - b->tt_base_ms) * b->tt_cpt;
+        return b->tt_switch + (b->tt_target - at) * b->tt_next;
+    }
     return b->tt_base_cycle + (b->tt_target - b->tt_base_ms) * b->tt_cpt;
 }
 
@@ -193,7 +211,7 @@ uint32_t soc_irq_lines(bao_t *b)
     for (a = 0; a < 20; a++)
         if (b->irq[a].pending & b->irq[a].enable)
             l |= 1u << a;
-    if (b->tt_pending & b->tt_enable)
+    if (tt_alarm_level(b) && b->tt_enable)
         l |= 1u << 20;
     if (b->t0_pending & b->t0_enable)
         l |= 1u << 30;
@@ -216,10 +234,6 @@ void soc_update(bao_t *b)
         soc_reset(b);
     }
 
-    if (b->tt_target != NEVER && tt_ms(b) >= b->tt_target) {
-        b->tt_pending = 1;
-        b->tt_target = NEVER;
-    }
     t = tt_alarm_cycle(b);
     if (t < n) n = t;
 
@@ -459,9 +473,7 @@ static uint32_t gpio_in(bao_t *b, int p);
 static void iox_int_check(bao_t *b)
 {
     int i;
-    if (!(b->iox[0x100 >> 2] | b->iox[0x104 >> 2] | b->iox[0x108 >> 2] | b->iox[0x10C >> 2] |
-          b->iox[0x110 >> 2] | b->iox[0x114 >> 2] | b->iox[0x118 >> 2] | b->iox[0x11C >> 2]))
-        return;
+    /* every slot follows its pin whether or not enabled (iox.sv 112) */
     for (i = 0; i < 8; i++) {
         uint32_t cr = b->iox[(0x100 >> 2) + i], sel = IOX_INT_SEL(cr), mode = IOX_INT_MODE(cr);
         int lvl = sel < 96 ? (int)((gpio_in(b, (int)(sel >> 4)) >> (sel & 15)) & 1) : 0;
@@ -474,8 +486,9 @@ static void iox_int_check(bao_t *b)
             else fire = !lvl;
         }
         if (lvl) b->iox_last |= 1u << i; else b->iox_last &= ~(1u << i);
-        if (fire && !(b->iox_fr & (1u << i))) {
-            b->iox_fr |= 1u << i;
+        /* slot i reads back in INTFR bit 7 - i (iox.sv 95, 138) */
+        if (fire && !(b->iox_fr & (0x80u >> i))) {
+            b->iox_fr |= 0x80u >> i;
             irq_raise(b, "ioxirq");
         } else if (fire && mode >= 2) {
             irq_raise(b, "ioxirq");
@@ -557,10 +570,10 @@ static int cpu_periph_read(bao_t *b, uint32_t a, uint32_t *v)
         case 0x08: *v = (uint32_t)ms; break;
         case 0x0C: *v = b->tt_target1; break;
         case 0x10: *v = b->tt_target0; break;
-        case 0x14: *v = b->tt_target == NEVER ? 1 : 0; break;
-        case 0x18: *v = b->tt_pending; break;
+        case 0x14: *v = tt_alarm_level(b); break;
+        case 0x18: *v = tt_alarm_level(b); break;
         case 0x1C: *v = b->tt_enable; break;
-        case 0x20: *v = b->tt_cpt; break;
+        case 0x20: *v = b->tt_reg; break;
         default: *v = 0;
         }
         return 0;
@@ -610,14 +623,24 @@ static int cpu_periph_write(bao_t *b, uint32_t a, uint32_t v)
     if ((a & ~0xFFFu) == 0xE001B000u) {
         switch (off) {
         case 0x00:
-            if (v & 1) { b->tt_base_ms = 0; b->tt_base_cycle = b->cycles; }
+            if (v & 1) {
+                b->tt_base_ms = 0;
+                b->tt_base_cycle = b->cycles;
+                b->tt_cpt = b->tt_reg + 1;
+                b->tt_next = 0;
+            }
             break;
         case 0x0C: b->tt_target1 = v; b->tt_target = ((uint64_t)v << 32) | b->tt_target0; break;
         case 0x10: b->tt_target0 = v; b->tt_target = ((uint64_t)b->tt_target1 << 32) | v; break;
-        case 0x18: if (v & 1) b->tt_pending = 0; break;
+        case 0x18: break;
         case 0x1C: b->tt_enable = v & 1; break;
         case 0x20:
-            if (v) { tt_rebase(b); b->tt_cpt = v; }
+            if (v != 0xFFFFFFFFu) {
+                uint64_t ms = tt_ms(b);
+                b->tt_reg = v;
+                b->tt_next = v + 1;
+                b->tt_switch = b->tt_base_cycle + (ms + 1 - b->tt_base_ms) * b->tt_cpt;
+            }
             break;
         default: break;
         }
@@ -690,24 +713,57 @@ static void wdt_update(bao_t *b)
  */
 #define RTC_OSC_HZ      23970u
 #define RTC_FD0_HZ      8360u
+#define RTC_FD_TOP      0x4000u
 
-static uint64_t rtc_ticks(bao_t *b, uint64_t dc)
+/* 1 Hz divider (ao_sysctrl.sv 496 to 498): clk1hzcnt clears only when it
+ * equals CLK1HZFD, so a divider written below the running count waits for
+ * the 14 bit count to wrap */
+static uint64_t rtc_first_hit(bao_t *b)
 {
-    if (b->rtc_fd == 0)
-        return dc * RTC_FD0_HZ / BAO_ACLK_HZ;
-    return dc * RTC_OSC_HZ / ((uint64_t)BAO_ACLK_HZ * 2u * (b->rtc_fd + 1u));
+    if (b->rtc_cnt0 <= b->rtc_fd)
+        return b->rtc_fd - b->rtc_cnt0 + 1u;
+    return RTC_FD_TOP - b->rtc_cnt0 + b->rtc_fd + 1u;
 }
 
+static uint64_t rtc_edges(bao_t *b, uint64_t dc, uint32_t *cnt, uint32_t *lvl)
+{
+    uint64_t n, first, t;
+    if (b->rtc_fd == 0) {
+        if (cnt) *cnt = 0;
+        if (lvl) *lvl = b->rtc_lvl0;
+        return dc * RTC_FD0_HZ / BAO_ACLK_HZ;
+    }
+    n = dc * RTC_OSC_HZ / BAO_ACLK_HZ;
+    first = rtc_first_hit(b);
+    if (n < first) {
+        if (cnt) *cnt = (uint32_t)(b->rtc_cnt0 + n) & (RTC_FD_TOP - 1u);
+        if (lvl) *lvl = b->rtc_lvl0;
+        return 0;
+    }
+    t = 1u + (n - first) / (b->rtc_fd + 1u);
+    if (cnt) *cnt = (uint32_t)((n - first) % (b->rtc_fd + 1u));
+    if (lvl) *lvl = b->rtc_lvl0 ^ (uint32_t)(t & 1u);
+    return b->rtc_lvl0 ? t / 2u : (t + 1u) / 2u;
+}
+
+/* RTC_LR lands at the next rising clk1hz edge and reads as the value plus
+ * one; the counter reads 0 until then (as measured on the Dabao) */
 static uint32_t rtc_raw(bao_t *b)
 {
+    uint64_t e;
     if (!(b->rtc_cr & 1))
-        return b->rtc_frozen;
-    return b->rtc_lr + (uint32_t)rtc_ticks(b, b->cycles - b->rtc_base);
+        return b->rtc_pend ? 0 : b->rtc_frozen;
+    e = rtc_edges(b, b->cycles - b->rtc_base, NULL, NULL);
+    if (b->rtc_pend && e == 0)
+        return 0;
+    return b->rtc_lr + (uint32_t)e;
 }
 
 static uint32_t rtc_value(bao_t *b)
 {
     uint32_t v = rtc_raw(b);
+    if (b->rtc_pend && v == 0)
+        return 0;
     if (v != b->rtc_seen) {
         if ((uint32_t)(b->rtc_mr - b->rtc_seen - 1u) < (uint32_t)(v - b->rtc_seen))
             b->rtc_ris = 1;
@@ -719,24 +775,38 @@ static uint32_t rtc_value(bao_t *b)
 /* the first cycle at which the RTC count reaches its match register */
 static uint64_t rtc_match_cycle(bao_t *b)
 {
-    uint64_t k, per;
+    uint64_t k, t, n;
     if (!(b->rtc_cr & 1) || b->rtc_fd == 0)
         return NEVER;
     rtc_value(b);
     k = (uint32_t)(b->rtc_mr - b->rtc_lr);
     if (k == 0)
         k = 1ull << 32;
-    if (k <= rtc_ticks(b, b->cycles - b->rtc_base))
+    if (k <= rtc_edges(b, b->cycles - b->rtc_base, NULL, NULL))
         return b->cycles;
-    per = (uint64_t)BAO_ACLK_HZ * 2u * (b->rtc_fd + 1u);
-    return b->rtc_base + (k * per + RTC_OSC_HZ - 1u) / RTC_OSC_HZ;
+    t = b->rtc_lvl0 ? 2u * k : 2u * k - 1u;
+    n = rtc_first_hit(b) + (t - 1u) * (b->rtc_fd + 1u);
+    return b->rtc_base + (n * BAO_ACLK_HZ + RTC_OSC_HZ - 1u) / RTC_OSC_HZ;
 }
 
+/* bring the divider and the count up to now; the divider runs whether or
+ * not the RTC is enabled */
 static void rtc_rebase(bao_t *b)
 {
-    uint32_t v = rtc_value(b);
-    b->rtc_lr = v;
-    b->rtc_frozen = v;
+    uint32_t cnt, lvl;
+    uint64_t e;
+    rtc_value(b);
+    e = rtc_edges(b, b->cycles - b->rtc_base, &cnt, &lvl);
+    if (b->rtc_cr & 1) {
+        if (e) {
+            b->rtc_lr += (uint32_t)e;
+            b->rtc_pend = 0;
+        }
+        if (!b->rtc_pend)
+            b->rtc_frozen = b->rtc_lr;
+    }
+    b->rtc_cnt0 = cnt;
+    b->rtc_lvl0 = lvl;
     b->rtc_base = b->cycles;
 }
 
@@ -907,15 +977,15 @@ static int ao_write(bao_t *b, uint32_t a, uint32_t v)
             b->rtc_mr = v;
             return 0;
         case 0x008:
-            rtc_value(b);
+            rtc_rebase(b);
             b->rtc_lr = v;
             b->rtc_frozen = v;
-            b->rtc_base = b->cycles;
             b->rtc_seen = v;
+            b->rtc_pend = 1;
             return 0;
         case 0x00C:
-            if ((v & 1) && !(b->rtc_cr & 1)) { b->rtc_lr = b->rtc_frozen; b->rtc_base = b->cycles; }
-            if (!(v & 1) && (b->rtc_cr & 1)) b->rtc_frozen = rtc_value(b);
+            rtc_rebase(b);
+            if ((v & 1) && !(b->rtc_cr & 1)) b->rtc_lr = b->rtc_frozen;
             b->rtc_cr = v & 1;
             return 0;
         case 0x010: b->rtc_imsc = v & 1; return 0;
@@ -968,7 +1038,7 @@ static void pd_update(bao_t *b)
             b->pd_at = NEVER;
             return;
         }
-        uint32_t keep[8];
+        uint32_t keep[11];
         uint64_t keep_base = b->rtc_base;
         b->pd_count++;
         bao_logf(b, BAO_LOG_INFO, "power down %u: SoC held in reset", b->pd_count);
@@ -976,10 +1046,12 @@ static void pd_update(bao_t *b)
          * when the reset is released, so the RTC is kept as it is */
         keep[0] = b->rtc_lr; keep[1] = b->rtc_cr; keep[2] = b->rtc_frozen; keep[3] = b->rtc_fd;
         keep[4] = b->rtc_mr; keep[5] = b->rtc_imsc; keep[6] = b->rtc_ris; keep[7] = b->rtc_seen;
+        keep[8] = b->rtc_cnt0; keep[9] = b->rtc_lvl0; keep[10] = b->rtc_pend;
         cpu_reset(b);
         soc_reset(b);
         b->rtc_lr = keep[0]; b->rtc_cr = keep[1]; b->rtc_frozen = keep[2]; b->rtc_fd = keep[3];
         b->rtc_mr = keep[4]; b->rtc_imsc = keep[5]; b->rtc_ris = keep[6]; b->rtc_seen = keep[7];
+        b->rtc_cnt0 = keep[8]; b->rtc_lvl0 = keep[9]; b->rtc_pend = keep[10];
         b->rtc_base = keep_base;
         b->pd_state = 2;
         b->pd_at = NEVER;
@@ -1041,7 +1113,9 @@ static int pmu_write(bao_t *b, uint32_t a, uint32_t v)
     }
 }
 
-/* CGU and sysctrl registers (sysctrl.sv 831 to 884): kind 0 CR, 1 AR, 2 not modelled */
+/* CGU and sysctrl registers (sysctrl.sv 831 to 884): kind 0 CR, 1 AR, 2 not modelled.
+ * IPCPLLMN, IPCPLLQ and CGUSEL0 start as boot1 leaves them; the frequency
+ * sensors (freqmeter.sv) are derived from the clock registers on each read. */
 typedef struct { uint16_t off; uint8_t kind, count; uint32_t mask, iv; } cgu_sfr_t;
 
 static const cgu_sfr_t cgu_sfrs[] = {
@@ -1074,12 +1148,66 @@ static void cgu_reset(bao_t *b)
         for (c = 0; c < cgu_sfrs[i].count; c++)
             if ((slot = bao_mmio_slot(b, 0x40040000u + cgu_sfrs[i].off + 4u * c)) != NULL)
                 *slot = cgu_sfrs[i].iv;
+    /* As boot1 leaves them, read on a Dabao */
+    if ((slot = bao_mmio_slot(b, 0x400400A0u)) != NULL) *slot = 0x40AFu;
+    if ((slot = bao_mmio_slot(b, 0x400400A8u)) != NULL) *slot = 0x0020u;
+    if ((slot = bao_mmio_slot(b, 0x40040010u)) != NULL) *slot = 1u;
+}
+
+static uint32_t cgu_reg(bao_t *b, uint32_t off)
+{
+    uint32_t *slot = bao_mmio_slot(b, 0x40040000u + off);
+    return slot ? *slot : 0;
+}
+
+static uint32_t fs_reading(uint32_t khz)
+{
+    return (uint32_t)((uint64_t)khz * 2089u / 2100u / 1000u) & 0xFFFFu;
+}
+
+/* The two frequency sensor words a Dabao was read on, and the valid flags */
+static int cgu_sensor(bao_t *b, uint32_t off, uint32_t *v)
+{
+    uint32_t mn = cgu_reg(b, 0xA0), q = cgu_reg(b, 0xA8);
+    uint32_t m = (mn >> 12) & 0x1Fu, n = mn & 0xFFFu;
+    uint32_t vco = m ? 48000u / m * n : 0;
+    uint32_t d0 = ((q & 7u) + 1) * (((q >> 4) & 7u) + 1);
+    uint32_t d1 = (((q >> 8) & 7u) + 1) * (((q >> 12) & 7u) + 1);
+    uint32_t pll0 = vco / d0, pll1 = vco / d1;
+    uint32_t fclk = (cgu_reg(b, 0x10) & 1u) ? pll0 / 2 : 48000u;
+    uint32_t pke = (uint32_t)((uint64_t)pll1 * ((cgu_reg(b, 0x34) & 0xFFu) + 1) / 256u);
+
+    if (off == 0x50) {
+        *v = 0xFFu;
+        return 1;
+    }
+    if (off == 0x40) {
+        *v = (fs_reading(fclk) << 16) | (d1 == 1 ? fs_reading(vco) : fs_reading(pke));
+        return 1;
+    }
+    if (off == 0x4C) {
+        *v = (fs_reading(pll0) << 16) | (d1 == 1 ? 41u : fs_reading(pll1));
+        return 1;
+    }
+    /* nominal rates, not read on a board */
+    if (off == 0x48) {
+        *v = (fs_reading(48000u) << 16) | fs_reading(32000u);
+        return 1;
+    }
+    if (off == 0x44) {
+        *v = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static uint32_t cgu_read(bao_t *b, uint32_t a)
 {
     const cgu_sfr_t *s = cgu_sfr(a);
     uint32_t *slot = bao_mmio_slot(b, a);
+    uint32_t sensor;
+    if (cgu_sensor(b, a & 0xFFFu, &sensor))
+        return sensor;
     if (!s) {
         note_once(b, a, "CGU read with no register, reads 0,");
         return 0;
@@ -1326,10 +1454,12 @@ void soc_reset(bao_t *b)
 {
     int p;
     memset(b->irq, 0, sizeof(b->irq));
-    b->tt_cpt = BAO_ACLK_HZ / 1000;
+    b->tt_reg = BAO_ACLK_HZ / 1000;
+    b->tt_cpt = b->tt_reg + 1;
+    b->tt_next = 0;
     b->tt_base_cycle = b->cycles;
     b->tt_base_ms = 0;
-    b->tt_target = NEVER;
+    b->tt_target = 0;
     b->tt_target0 = b->tt_target1 = 0;
     b->tt_pending = b->tt_enable = 0;
     b->t0_load = b->t0_reload = b->t0_en = b->t0_latched = 0;
@@ -1346,6 +1476,7 @@ void soc_reset(bao_t *b)
         b->rtc_fd = 15;
         b->rtc_lr = b->rtc_frozen = b->rtc_seen = 0xFFFE2000u;
         b->rtc_cr = 1;
+        b->rtc_cnt0 = b->rtc_lvl0 = b->rtc_pend = 0;
         b->rtc_base = b->cycles;
     }
     /* The sysctrl ATimer resets with the core; the always on one only at
@@ -1388,6 +1519,7 @@ void ff_backedge(bao_t *b, uint32_t pc)
          * which is at most one period back */
         if (b->ff_ttdep) {
             uint64_t edge = b->cycles;
+            tt_sync(b);
             if (b->ff_cycles >= b->tt_base_cycle) {
                 uint64_t ms = b->tt_base_ms + (b->ff_cycles - b->tt_base_cycle) / b->tt_cpt;
                 edge = b->tt_base_cycle + (ms + 1 - b->tt_base_ms) * b->tt_cpt;

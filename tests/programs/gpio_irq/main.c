@@ -13,7 +13,7 @@ static volatile uint32_t hits;
 static void on_iox(uint32_t ev)
 {
     (void)ev;
-    REG32(0x5012F120) = 1;
+    REG32(0x5012F120) = 0x80;
     hits++;
 }
 

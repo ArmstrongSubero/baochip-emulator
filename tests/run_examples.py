@@ -498,7 +498,7 @@ def check(name, elf, tmp):
                 "s            f7cb1c942d657c41... PASS", "\"sample\" verify 0", "\"sampLe\" verify -4"]
         ms = 400
     elif name == "ch14_1401":
-        need = ["busy: 34", "WFI:  "]
+        need = ["busy: ", "WFI:  "]
         ms = 2500
     elif name == "ch14_1402":
         need = ["powering down at 5 s, alarm at 15 s", "Woke from power down at 15 s"]
@@ -679,6 +679,11 @@ def check(name, elf, tmp):
         m = [l for l in text.splitlines() if l.startswith("edges counted by core 1: ")]
         if not m or int(m[0].split(":")[1].split(",")[0]) < 10:
             missing.append("core 1 counting edges")
+    if name == "ch14_1401":
+        import re
+        m = re.search(r"busy: (\d+) cycles", text)
+        if not m or abs(int(m.group(1)) - 350000000) > 1000:
+            missing.append("a busy second of 350 million cycles")
     if name == "ch17_1701":
         import re
         m = re.search(r"256 words in (\d+) us", text)
@@ -731,7 +736,9 @@ def main():
     fails = 0
     for name in names:
         elf = os.path.join(sdk, "build", name + ".elf")
-        if name in NOT_MODELLED:
+        if name.startswith("rtos_"):
+            result, note = "skip", "FreeRTOS, run by third_party/freertos/tests/run_rtos.py"
+        elif name in NOT_MODELLED:
             result, note = "n/a", "PKE and the big number ALU are not modelled yet"
         elif not os.path.exists(elf):
             result, note = "skip", "no build/%s.elf" % name

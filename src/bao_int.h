@@ -58,6 +58,7 @@ typedef struct {
     uint8_t  host_q[4096];
     int      host_head, host_count;
     uint64_t tx_done_at;
+    uint64_t tx_shift_until;    /* the last byte handed over is still on the wire until then */
     uint64_t rx_next_at;
     int      tx_busy;
     uint8_t  tx_pending[0x10000];
@@ -205,7 +206,10 @@ struct bao {
 
     irqarr_t irq[20];
 
-    uint32_t tt_cpt;
+    uint32_t tt_cpt;            /* cycles in one tick: the register value plus one */
+    uint32_t tt_reg;            /* CLOCKS_PER_TICK as written */
+    uint32_t tt_next;           /* divider waiting for the prescaler to reach zero, 0 if none */
+    uint64_t tt_switch;         /* the cycle it takes over at */
     uint64_t tt_base_cycle;
     uint64_t tt_base_ms;
     uint64_t tt_target;
@@ -231,6 +235,7 @@ struct bao {
     uint64_t pd_at;         /* cycle of the next power down step */
     uint32_t pd_count;
     uint32_t rtc_lr, rtc_cr, rtc_frozen, rtc_fd, rtc_mr, rtc_imsc, rtc_ris, rtc_seen;
+    uint32_t rtc_cnt0, rtc_lvl0, rtc_pend;  /* divider count and clk1hz level at rtc_base, load not landed */
     uint32_t at_cfg[4], at_cmp[4], at_base_val[4];
     uint64_t at_base[4];
     uint64_t rtc_base;
@@ -320,6 +325,7 @@ int  bus_dma_write(bao_t *b, uint32_t addr, const uint8_t *src, uint32_t len);
 int  mmio_read(bao_t *b, uint32_t addr, int size, uint32_t *val);
 int  mmio_write(bao_t *b, uint32_t addr, int size, uint32_t val);
 void soc_reset(bao_t *b);
+void tt_sync(bao_t *b);
 void soc_update(bao_t *b);
 uint32_t soc_irq_lines(bao_t *b);
 void irq_raise(bao_t *b, const char *event);
